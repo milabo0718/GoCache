@@ -1,12 +1,46 @@
 package gocache
 
-import "time"
+import (
+	"sync"
 
-// Cache defines the core operations shared by cache implementations.
-type Cache[K comparable, V any] interface {
-	Get(key K) (V, bool)
-	Set(key K, value V, ttl time.Duration)
-	Delete(key K)
-	Clear()
-	Len() int
+	"github.com/milabo0718/gocache/memory"
+)
+
+type Cache struct {
+	mu    sync.RWMutex
+	store memory.Store
+}
+
+func NewCache() *Cache {
+	return &Cache{
+		store: memory.NewCache("LRU", 100), // default to 100 items
+	}
+}
+
+func (c *Cache) Get(key string) (ByteView, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if v, ok := c.store.Get(key); ok {
+		return ByteView{b: v}, true
+	}
+	return ByteView{}, false
+}
+
+func (c *Cache) Set(key string, value []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.store.Set(key, value)
+}
+
+func (c *Cache) Delete(key string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	flag, err := c.store.Delete(key)
+	if !flag {
+		return err
+	}
+	return nil
 }
