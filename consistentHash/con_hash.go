@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Map struct {
@@ -26,12 +27,14 @@ type Map struct {
 }
 
 func NewMap() *Map {
-	return &Map{
+	m := &Map{
 		config:           DefaultConfig,
 		hashMap:          make(map[int]string),
 		nodeVirtualCount: make(map[string]int),
 		nodeLoad:         make(map[string]float64),
 	}
+	m.startLoadBalancer()
+	return m
 }
 
 func (m *Map) Add(nodes ...string) error {
@@ -67,19 +70,8 @@ func (m *Map) Remove(node string) error {
 		return errors.New("node not found")
 	}
 
-	for i := 0; i < cnt; i++ {
-		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
-		delete(m.hashMap, hash)
-		for j := 0; j < len(m.keys); j++ {
-			if m.keys[j] == hash {
-				m.keys = append(m.keys[:j], m.keys[j+1:]...)
-				break
-			}
-		}
-	}
-
-	delete(m.nodeVirtualCount, node)
-	delete(m.nodeLoad, node)
+	m.removeNode(node)
+	sort.Ints(m.keys)
 	return nil
 }
 
@@ -88,8 +80,8 @@ func (m *Map) Get(key string) string {
 		return ""
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	if len(m.keys) == 0 {
 		return ""
@@ -121,9 +113,32 @@ func (m *Map) addNode(node string, virtualNodeCount int) {
 	m.nodeVirtualCount[node] = virtualNodeCount
 }
 
+func (m *Map) removeNode(node string) {
+	cnt := m.nodeVirtualCount[node]
+	for i := 0; i < cnt; i++ {
+		hash := int(m.config.HashFunc([]byte(fmt.Sprintf("%s-%d", node, i))))
+		delete(m.hashMap, hash)
+		for j := 0; j < len(m.keys); j++ {
+			if m.keys[j] == hash {
+				m.keys = append(m.keys[:j], m.keys[j+1:]...)
+				break
+			}
+		}
+	}
+
+	delete(m.nodeVirtualCount, node)
+	delete(m.nodeLoad, node)
+}
+
 func (m *Map) checkAndRebalance() {
 	// 样本不足，不进行负载均衡
 	if atomic.LoadInt64(&m.totalRequest) < 1000 {
+		return
+	}
+
+	m.mu.RLock()
+	if len(m.nodeVirtualCount) == 0 {
+		m.mu.RUnlock()
 		return
 	}
 
@@ -137,6 +152,7 @@ func (m *Map) checkAndRebalance() {
 			maxDiff = diff / avgLoad
 		}
 	}
+	m.mu.RUnlock()
 
 	// 如果负载不均衡度超过阈值，调整虚拟节点
 	if maxDiff > m.config.LoadBalanceThreshold {
@@ -148,11 +164,15 @@ func (m *Map) rebalanceNodes() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if len(m.nodeVirtualCount) == 0 {
+		return
+	}
+
 	avgLoad := float64(m.totalRequest) / float64(len(m.nodeVirtualCount))
 	// 重新计算每个节点的虚拟节点数量
-	for node, count := range m.nodeVirtualCount {
+	for node := range m.nodeVirtualCount {
 		curNodeCnt := m.nodeVirtualCount[node]
-		loadRatio := float64(count) / avgLoad
+		loadRatio := m.nodeLoad[node] / avgLoad
 
 		var newCnt int
 		if loadRatio > 1 {
@@ -170,19 +190,44 @@ func (m *Map) rebalanceNodes() {
 		}
 
 		if newCnt != curNodeCnt {
-			if err := m.Remove(node); err != nil {
-				fmt.Printf("failed to remove node %s: %v\n", node, err)
-				continue
-			}
+			m.removeNode(node)
 			m.addNode(node, newCnt)
 		}
 	}
 
-	for node := range m.nodeVirtualCount {
-		m.nodeVirtualCount[node] = 0
+	for node := range m.nodeLoad {
+		m.nodeLoad[node] = 0
 	}
 	atomic.StoreInt64(&m.totalRequest, 0)
 
 	// 重新排序
 	sort.Ints(m.keys)
+}
+
+func (m *Map) GetLoad(node string) map[string]float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	load := make(map[string]float64)
+	total := atomic.LoadInt64(&m.totalRequest)
+	if total == 0 {
+		return load
+	}
+
+	for n, count := range m.nodeLoad {
+		load[n] = count / float64(total)
+	}
+
+	return load
+}
+
+func (m *Map) startLoadBalancer() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			m.checkAndRebalance()
+		}
+	}()
 }
